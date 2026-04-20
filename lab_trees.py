@@ -258,13 +258,22 @@ def plot_calibration_curves(rf_default, rf_balanced, X_test, y_test, output_path
 # ---------------------------------------------------------------------------
 
 
-def build_logistic_regression(X_train_scaled, y_train, random_state=42):
+def build_logistic_regression(
+    X_train_scaled, y_train, class_weight=None, random_state=42
+):
     """Train a LogisticRegression baseline on scaled features.
+
+    Args:
+        class_weight: None for default, 'balanced' to reweight the loss
+            so minority-class samples count more during training.
+        random_state: Random seed.
 
     Returns:
         Fitted LogisticRegression(max_iter=1000).
     """
-    clf = LogisticRegression(max_iter=1000, random_state=random_state)
+    clf = LogisticRegression(
+        max_iter=1000, class_weight=class_weight, random_state=random_state
+    )
     clf.fit(X_train_scaled, y_train)
     return clf
 
@@ -331,7 +340,7 @@ def main():
         print(f"\n--- Decision Tree (max_depth=5) ---")
         print(classification_report(y_test, dt.predict(X_test), zero_division=0))
         # Plot tree (first 3 levels)
-        plt.figure(figsize=(18, 10))
+        plt.figure(figsize=(14, 8))
         plot_tree(
             dt, feature_names=NUMERIC_FEATURES, max_depth=3, filled=True, fontsize=8
         )
@@ -384,7 +393,33 @@ def main():
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+
     lr = build_logistic_regression(X_train_scaled, y_train)
+    lr_bal = build_logistic_regression(X_train_scaled, y_train, class_weight="balanced")
+
+    if lr is not None and lr_bal is not None:
+        print(f"\n--- Logistic Regression (default, class_weight=None) ---")
+        print(classification_report(y_test, lr.predict(X_test_scaled), zero_division=0))
+
+        print(f"--- Logistic Regression (balanced, class_weight='balanced') ---")
+        print(
+            classification_report(
+                y_test, lr_bal.predict(X_test_scaled), zero_division=0
+            )
+        )
+
+        r_lr_def = evaluate_recall_at_threshold(lr, X_test_scaled, y_test)
+        r_lr_bal = evaluate_recall_at_threshold(lr_bal, X_test_scaled, y_test)
+        auc_lr_def = compute_pr_auc(lr, X_test_scaled, y_test)
+        auc_lr_bal = compute_pr_auc(lr_bal, X_test_scaled, y_test)
+
+        print(f"  LR default  recall@0.5: {r_lr_def:.3f}   PR-AUC: {auc_lr_def:.3f}")
+        print(f"  LR balanced recall@0.5: {r_lr_bal:.3f}   PR-AUC: {auc_lr_bal:.3f}")
+        print(
+            "Note: same pattern as RF — class_weight shifts recall at the default "
+            "0.5 threshold but does not improve PR-AUC ranking."
+        )
+
     if rf is not None and lr is not None:
         d = find_tree_vs_linear_disagreement(
             rf, lr, X_test, X_test_scaled, y_test, NUMERIC_FEATURES
