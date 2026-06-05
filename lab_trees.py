@@ -31,11 +31,13 @@ from sklearn.metrics import (
     average_precision_score,
     classification_report,
     recall_score,
+    precision_score,
+    f1_score,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier, plot_tree
-
+from sklearn.inspection import permutation_importance
 
 NUMERIC_FEATURES = [
     "tenure",
@@ -316,6 +318,235 @@ def find_tree_vs_linear_disagreement(
 
 
 # ---------------------------------------------------------------------------
+# Tier 1 — Threshold tuning
+# ---------------------------------------------------------------------------
+
+
+def sweep_thresholds(model, X_test, y_test, output_path, thresholds=None):
+    """Sweep thresholds 0.10–0.90, plot precision/recall/F1, save PNG.
+
+    Args:
+        model: Fitted classifier with predict_proba.
+        X_test: Test features (raw, unscaled — RF consumes these).
+        y_test: True binary labels.
+        output_path: Where to save the PNG.
+        thresholds: Array of thresholds to sweep (default 0.10–0.90 step 0.05).
+
+    Returns:
+        Dict with keys:
+          - best_f1_threshold (float)
+          - threshold_80_recall (float or None)
+          - results (list of dicts with threshold/precision/recall/f1)
+    """
+
+    if thresholds is None:
+        thresholds = np.arange(0.10, 0.91, 0.05)
+
+    y_prob = model.predict_proba(X_test)[:, 1]
+    y_true = np.asarray(y_test)
+
+    precisions, recalls, f1s = [], [], []
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        precisions.append(precision_score(y_true, y_pred, zero_division=0))
+        recalls.append(recall_score(y_true, y_pred, zero_division=0))
+        f1s.append(f1_score(y_true, y_pred, zero_division=0))
+
+    precisions = np.array(precisions)
+    recalls = np.array(recalls)
+    f1s = np.array(f1s)
+
+    best_f1_idx = int(np.argmax(f1s))
+    best_f1_threshold = float(thresholds[best_f1_idx])
+
+    # First threshold where recall >= 0.80
+    recall_80_mask = recalls >= 0.80
+    threshold_80_recall = (
+        float(thresholds[recall_80_mask][0]) if recall_80_mask.any() else None
+    )
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot(thresholds, precisions, marker="o", label="Precision", color="#2196F3")
+    ax.plot(thresholds, recalls, marker="s", label="Recall", color="#4CAF50")
+    ax.plot(thresholds, f1s, marker="^", label="F1", color="#FF5722")
+
+    ax.axvline(
+        best_f1_threshold,
+        color="#FF5722",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Best F1 threshold = {best_f1_threshold:.2f}",
+    )
+    if threshold_80_recall is not None:
+        ax.axvline(
+            threshold_80_recall,
+            color="#4CAF50",
+            linestyle=":",
+            alpha=0.7,
+            label=f"80% Recall threshold = {threshold_80_recall:.2f}",
+        )
+
+    ax.set_xlabel("Decision Threshold")
+    ax.set_ylabel("Score")
+    ax.set_title(
+        "Threshold Sweep — Balanced RF\n"
+        "Precision, Recall, and F1 vs Decision Threshold"
+    )
+    ax.legend(loc="center left")
+    ax.set_xlim(0.08, 0.92)
+    ax.set_ylim(0, 1.05)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    results = [
+        {
+            "threshold": float(t),
+            "precision": float(p),
+            "recall": float(r),
+            "f1": float(f),
+        }
+        for t, p, r, f in zip(thresholds, precisions, recalls, f1s)
+    ]
+    return {
+        "best_f1_threshold": best_f1_threshold,
+        "threshold_80_recall": threshold_80_recall,
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — Permutation importance vs MDI
+# ---------------------------------------------------------------------------
+
+
+def plot_permutation_vs_mdi(rf_balanced, X_test, y_test, feature_names, output_path):
+    """Side-by-side bar chart: MDI vs permutation importance.
+
+    Args:
+        rf_balanced: Fitted RandomForestClassifier (balanced).
+        X_test: Raw test features (DataFrame or array).
+        y_test: True labels.
+        feature_names: List of feature name strings.
+        output_path: Where to save the PNG.
+
+    Returns:
+        Dict with keys 'mdi' and 'permutation', each a dict of
+        {feature_name: importance} sorted descending.
+    """
+
+    # MDI importances (already computed on train set internally by sklearn)
+    mdi = dict(zip(feature_names, rf_balanced.feature_importances_))
+
+    # Permutation importance on the held-out test set (more reliable)
+    perm_result = permutation_importance(
+        rf_balanced,
+        X_test,
+        y_test,
+        n_repeats=30,
+        random_state=42,
+        n_jobs=-1,
+        scoring="average_precision",
+    )
+    perm = dict(zip(feature_names, perm_result.importances_mean))
+
+    # Sort both by MDI descending for consistent ordering
+    features_sorted = sorted(feature_names, key=lambda f: mdi[f], reverse=True)
+
+    mdi_vals = [mdi[f] for f in features_sorted]
+    perm_vals = [perm[f] for f in features_sorted]
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    x = np.arange(len(features_sorted))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    bars_mdi = ax.bar(
+        x - width / 2, mdi_vals, width, label="MDI (train)", color="#2196F3", alpha=0.85
+    )
+    bars_perm = ax.bar(
+        x + width / 2,
+        perm_vals,
+        width,
+        label="Permutation (test)",
+        color="#FF5722",
+        alpha=0.85,
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(features_sorted, rotation=30, ha="right", fontsize=10)
+    ax.set_ylabel("Importance")
+    ax.set_title(
+        "Feature Importance: MDI vs Permutation\n"
+        "Balanced Random Forest — Top 8 Features"
+    )
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "mdi": {f: mdi[f] for f in features_sorted},
+        "permutation": {f: perm[f] for f in features_sorted},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — Custom voting ensemble
+# ---------------------------------------------------------------------------
+
+
+class VotingEnsemble:
+    """Custom soft-voting ensemble over a list of fitted sklearn classifiers.
+
+    Implements predict() via majority hard vote and predict_proba() via
+    averaged probabilities. Handles classifiers whose .classes_ attribute
+    may not be ordered [0, 1] by remapping columns before averaging.
+
+    Args:
+        estimators: List of (name, fitted_clf) tuples, sklearn convention.
+    """
+
+    def __init__(self, estimators):
+        self.estimators = estimators  # [(name, clf), ...]
+        self.classes_ = np.array([0, 1])  # binary assumption
+
+    # VotingEnsemble does not need .fit() because all estimators are already
+    # fitted before being passed in — but we expose a no-op for sklearn
+    # convention compatibility.
+    def fit(self, X, y):
+        return self
+
+    def _align_proba(self, clf, X):
+        """Return predict_proba columns guaranteed in [class-0, class-1] order."""
+        proba = clf.predict_proba(X)
+        classes = list(clf.classes_)
+        if classes == [0, 1]:
+            return proba
+        # Re-order columns to match [0, 1]
+        idx0 = classes.index(0)
+        idx1 = classes.index(1)
+        return proba[:, [idx0, idx1]]
+
+    def predict_proba(self, X):
+        """Average predict_proba across all estimators (soft voting)."""
+        probas = [self._align_proba(clf, X) for _, clf in self.estimators]
+        return np.mean(probas, axis=0)
+
+    def predict(self, X):
+        """Majority hard vote across all estimators."""
+        votes = np.stack(
+            [clf.predict(X) for _, clf in self.estimators], axis=1
+        )  # shape (n_samples, n_estimators)
+        # Majority vote: sum > half the classifiers → predict 1
+        return (votes.sum(axis=1) > (len(self.estimators) / 2)).astype(int)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -433,6 +664,121 @@ def main():
             )
             print(f"  |diff| = {d['prob_diff']:.3f}   true label = {d['true_label']}")
             print(f"  Feature values: {d['feature_values']}")
+
+    # ── Tier 1: Threshold sweep ───────────────────────────────────────────
+    if rf_bal is not None:
+        print("\n=== Tier 1 — Threshold Sweep (Balanced RF) ===")
+        sweep = sweep_thresholds(rf_bal, X_test, y_test, "results/threshold_sweep.png")
+        print(f"  Best F1 threshold      : {sweep['best_f1_threshold']:.2f}")
+        print(f"  >=80% Recall threshold : {sweep['threshold_80_recall']}")
+        print("\n  Threshold  Precision  Recall    F1")
+        print("  " + "-" * 42)
+        for row in sweep["results"]:
+            print(
+                f"  {row['threshold']:.2f}       "
+                f"{row['precision']:.3f}     "
+                f"{row['recall']:.3f}     "
+                f"{row['f1']:.3f}"
+            )
+        t80 = sweep["threshold_80_recall"]
+        print(f"\n  >> Recommendation for 200 contacts/month:")
+        if t80 is not None:
+            print(f"     Use threshold={t80:.2f} to achieve >=80% recall.")
+        print("     Lower thresholds catch more churners (fewer false negatives)")
+        print("     but waste retention budget on non-churners (more false positives).")
+        print("     The F1-maximising threshold balances both costs optimally.")
+
+    # ── Tier 2: Permutation vs MDI ────────────────────────────────────────
+    if rf_bal is not None:
+        print("\n=== Tier 2 — Permutation vs MDI Importance ===")
+        imp_compare = plot_permutation_vs_mdi(
+            rf_bal, X_test, y_test, NUMERIC_FEATURES, "results/permutation_vs_mdi.png"
+        )
+        print(f"  {'Feature':<22s}  {'MDI':>8s}  {'Permutation':>12s}")
+        print("  " + "-" * 46)
+        for feat in imp_compare["mdi"]:
+            mdi_v = imp_compare["mdi"][feat]
+            perm_v = imp_compare["permutation"][feat]
+            print(f"  {feat:<22s}  {mdi_v:>8.3f}  {perm_v:>12.4f}")
+        """Explaination: 
+              Permutation importance and MDI (Mean Decrease in Impurity 
+              can produce different feature rankings because they measure 
+              importance in fundamentally different ways. MDI is calculated 
+              during training by tracking how much each feature reduces 
+              impurity (e.g., Gini) across all trees. However, this method 
+              is biased toward high-cardinality features, such as continuous 
+              variables or ID-like columns, because these features offer more 
+              potential split points and are therefore more likely to appear 
+              important—even if they are not truly predictive.
+
+              In contrast, permutation importance is computed after training by randomly
+              shuffling the values of a single feature and measuring the drop in model performance. 
+              This approach directly evaluates how much the model depends on that feature for making 
+              predictions. As a result, permutation importance provides a more realistic estimate of feature usefulness.
+
+              The two methods tend to disagree when a feature appears structurally useful for splitting
+               (high MDI) but does not meaningfully contribute to prediction accuracy (low permutation importance).
+               This often happens with noisy or high-cardinality features. Conversely, features that are highly predictive 
+              but less frequently used in splits may have lower MDI but higher permutation importance. Therefore, permutation
+             importance is generally more reliable for interpreting model behavior, especially when dealing with complex 
+              or high-dimensional data."""
+    # ── Tier 3: Custom voting ensemble ────────────────────────────────────
+    if rf_bal is not None and lr_bal is not None:
+        print("\n=== Tier 3 — Custom Voting Ensemble ===")
+
+        dt_bal = build_decision_tree(X_train, y_train, max_depth=5)
+
+        class ScaledLR:
+            """Wraps a fitted LR + its scaler into one sklearn-compatible object."""
+
+            def __init__(self, lr_model, fitted_scaler):
+                self.lr = lr_model
+                self.scaler = fitted_scaler
+                self.classes_ = lr_model.classes_
+
+            def predict_proba(self, X):
+                return self.lr.predict_proba(self.scaler.transform(X))
+
+            def predict(self, X):
+                return self.lr.predict(self.scaler.transform(X))
+
+        slr_bal = ScaledLR(lr_bal, scaler)
+
+        ensemble = VotingEnsemble(
+            [
+                ("lr_balanced", slr_bal),
+                ("dt_balanced", dt_bal),
+                ("rf_balanced", rf_bal),
+            ]
+        )
+
+        print("\n  -- Ensemble (LR_bal + DT_bal + RF_bal) --")
+        print(classification_report(y_test, ensemble.predict(X_test), zero_division=0))
+
+        auc_ensemble = average_precision_score(
+            y_test, ensemble.predict_proba(X_test)[:, 1]
+        )
+        auc_rf_bal = compute_pr_auc(rf_bal, X_test, y_test)
+        auc_dt_bal = compute_pr_auc(dt_bal, X_test, y_test)
+        auc_slr_bal = compute_pr_auc(slr_bal, X_test, y_test)
+
+        print(f"  PR-AUC comparison:")
+        print(f"    LR balanced  : {auc_slr_bal:.3f}")
+        print(f"    DT balanced  : {auc_dt_bal:.3f}")
+        print(f"    RF balanced  : {auc_rf_bal:.3f}")
+        print(f"    Ensemble     : {auc_ensemble:.3f}")
+
+        best_individual = max(auc_slr_bal, auc_dt_bal, auc_rf_bal)
+        if auc_ensemble > best_individual:
+            print("  Ensemble OUTPERFORMS the best individual model on PR-AUC.")
+        else:
+            print("  Ensemble does NOT outperform the best individual model.")
+        print(
+            "  Note: ensembles help most when constituent models make different errors."
+        )
+        print(
+            "  When one model dominates (RF >> LR, DT), averaging dilutes its signal."
+        )
 
 
 if __name__ == "__main__":
